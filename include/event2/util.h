@@ -675,6 +675,20 @@ void evutil_freeaddrinfo(struct evutil_addrinfo *ai);
 
 const char *evutil_gai_strerror(int err);
 
+struct evutil_secure_rng;
+
+/**
+ * Initialize a new secure random number generator context.
+ *
+ * @return an evrng context, or NULL if an error occured.
+ */
+struct evutil_secure_rng *evutil_secure_rng_new(void);
+
+/**
+ * Deallocate secure random number generator context rng.
+ */
+void evutil_secure_rng_free(struct evutil_secure_rng *rng);
+
 /** Generate n bytes of secure pseudorandom data, and store them in buf.
  *
  * Current versions of Libevent use an ARC4-based random number generator,
@@ -685,6 +699,7 @@ const char *evutil_gai_strerror(int err);
  * use this for serious cryptographic applications.
  */
 void evutil_secure_rng_get_bytes(void *buf, size_t n);
+void evutil_secure_rng_get_bytes_r(struct evutil_secure_rng *rng, void *buf, size_t n);
 
 /**
  * Seed the secure random number generator if needed, and return 0 on
@@ -703,6 +718,7 @@ void evutil_secure_rng_get_bytes(void *buf, size_t n);
  * program loses the ability to do it.
  */
 int evutil_secure_rng_init(void);
+int evutil_secure_rng_init_r(struct evutil_secure_rng *rng);
 
 /** Seed the random number generator with extra random bytes.
 
@@ -719,6 +735,7 @@ int evutil_secure_rng_init(void);
     @param datlen the number of bytes to read from datlen
  */
 void evutil_secure_rng_add_bytes(const char *dat, size_t datlen);
+void evutil_secure_rng_add_bytes_r(struct evutil_secure_rng *rng, const char *dat, size_t datlen);
 
 #ifdef __cplusplus
 }

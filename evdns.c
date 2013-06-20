@@ -355,6 +355,8 @@ struct evdns_base {
 	int getaddrinfo_ipv4_answered;
 	int getaddrinfo_ipv6_answered;
 
+	struct evutil_secure_rng *rng;
+
 	struct search_state *global_search_state;
 
 	TAILQ_HEAD(hosts_list, hosts_entry) hostsdb;
@@ -1310,7 +1312,7 @@ transaction_id_pick(struct evdns_base *base) {
 	ASSERT_LOCKED(base);
 	for (;;) {
 		u16 trans_id;
-		evutil_secure_rng_get_bytes(&trans_id, sizeof(trans_id));
+		evutil_secure_rng_get_bytes_r(base->rng, &trans_id, sizeof(trans_id));
 
 		if (trans_id == 0xffff) continue;
 		/* now check to see if that id is already inflight */
@@ -2741,7 +2743,7 @@ request_new(struct evdns_base *base, struct evdns_request *handle, int type,
 		unsigned i;
 		char randbits[(sizeof(namebuf)+7)/8];
 		strlcpy(namebuf, name, sizeof(namebuf));
-		evutil_secure_rng_get_bytes(randbits, (name_len+7)/8);
+		evutil_secure_rng_get_bytes_r(base->rng, randbits, (name_len+7)/8);
 		for (i = 0; i < name_len; ++i) {
 			if (EVUTIL_ISALPHA_(namebuf[i])) {
 				if ((randbits[i >> 3] & (1<<(i & 7))))
@@ -3859,12 +3861,6 @@ evdns_base_new(struct event_base *event_base, int flags)
 {
 	struct evdns_base *base;
 
-	if (evutil_secure_rng_init() < 0) {
-		log(EVDNS_LOG_WARN, "Unable to seed random number generator; "
-		    "DNS can't run.");
-		return NULL;
-	}
-
 	/* Give the evutil library a hook into its evdns-enabled
 	 * functionality.  We can't just call evdns_getaddrinfo directly or
 	 * else libevent-core will depend on libevent-extras. */
@@ -3878,6 +3874,13 @@ evdns_base_new(struct event_base *event_base, int flags)
 
 	EVTHREAD_ALLOC_LOCK(base->lock, EVTHREAD_LOCKTYPE_RECURSIVE);
 	EVDNS_LOCK(base);
+
+	base->rng = evutil_secure_rng_new();
+	if (!base->rng) {
+		log(EVDNS_LOG_WARN, "Unable to allocate random number generator; "
+		    "DNS can't run.");
+		return NULL;
+	}
 
 	/* Set max requests inflight and allocate req_heads. */
 	base->req_heads = NULL;
@@ -4028,6 +4031,8 @@ evdns_base_free_and_unlock(struct evdns_base *base, int fail_requests)
 			mm_free(victim);
 		}
 	}
+
+	evutil_secure_rng_free(base->rng);
 
 	mm_free(base->req_heads);
 

@@ -198,6 +198,7 @@ CORE_SRC =					\
 	event.c					\
 	evmap.c					\
 	evthread.c				\
+	arc4random.c				\
 	evutil.c				\
 	evutil_rand.c				\
 	evutil_time.c				\
@@ -261,6 +262,7 @@ noinst_HEADERS +=				\
 	evrpc-internal.h			\
 	evsignal-internal.h			\
 	evthread-internal.h			\
+	arc4random-internal.h			\
 	ht-internal.h				\
 	http-internal.h				\
 	iocp-internal.h				\

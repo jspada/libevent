@@ -39,17 +39,133 @@
 
 #include "util-internal.h"
 #include "evthread-internal.h"
+#include "mm-internal.h"
+#include "arc4random-internal.h"
+
+#ifdef EVENT__DISABLE_THREAD_SUPPORT
+	#define RNG_LOCK(rng)
+	#define RNG_UNLOCK(rng)
+#else
+	#define RNG_LOCK(rng) if (EVTHREAD_LOCKING_ENABLED()) \
+				EVLOCK_LOCK(rng->lock, 0)
+	#define RNG_UNLOCK(rng) if (EVTHREAD_LOCKING_ENABLED()) \
+					EVLOCK_UNLOCK(rng->lock, 0)
+#endif
+
+struct evutil_secure_rng {
+	struct arc4_stream state;
+#ifndef EVENT__DISABLE_THREAD_SUPPORT
+	void *lock;
+#endif
+};
+
+struct evutil_secure_rng *
+evutil_secure_rng_new(void)
+{
+	struct evutil_secure_rng *rng;
+
+	if ((rng = mm_calloc(1, sizeof(struct evutil_secure_rng))) == NULL) {
+		event_warn("%s: calloc", __func__);
+		return NULL;
+	}
+
+#ifndef EVENT__DISABLE_THREAD_SUPPORT
+	if (EVTHREAD_LOCKING_ENABLED())
+		EVTHREAD_ALLOC_LOCK(rng->lock, 0);
+
+	/*
+	 * We don't need to lock because no other thread could have a
+	 * handle to this context yet.
+	 */
+#endif
+
+	if (arc4random_init_r(&rng->state) == -1) {
+		event_warn("%s: rng init", __func__);
+		evutil_secure_rng_free(rng);
+        }
+
+	return rng;
+}
+
+void
+evutil_secure_rng_free(struct evutil_secure_rng *rng)
+{
+	if (!rng) {
+		event_warnx("%s: no rng to free", __func__);
+		return;
+	}
+
+#ifndef EVENT__DISABLE_THREAD_SUPPORT
+	if (EVTHREAD_LOCKING_ENABLED()) {
+		if (rng->lock) {
+			EVTHREAD_FREE_LOCK(rng->lock, 0);
+			rng->lock = NULL;
+		}
+	}
+#endif
+
+	mm_free(rng);
+}
+
+int
+evutil_secure_rng_init_r(struct evutil_secure_rng *rng)
+{
+	int ret;
+
+	if (!rng) {
+		event_warnx("%s: no rng to init", __func__);
+		return -1;
+	}
+
+	RNG_LOCK(rng);
+	ret = arc4random_init_r(&rng->state);
+	RNG_UNLOCK(rng);
+
+	return ret;
+}
+
+void
+evutil_secure_rng_get_bytes_r(struct evutil_secure_rng *rng, void *buf, size_t n)
+{
+	if (!rng) {
+		event_warnx("%s: no rng to get_bytes", __func__);
+		return;
+	}
+
+	RNG_LOCK(rng);
+	arc4random_buf_r(&rng->state, buf, n);
+	RNG_UNLOCK(rng);
+}
+
+void
+evutil_secure_rng_add_bytes_r(struct evutil_secure_rng *rng, const char *buf, size_t n)
+{
+	if (!rng) {
+		event_warnx("%s: no rng to add_bytes", __func__);
+		return;
+	}
+
+	RNG_LOCK(rng);
+	arc4random_addrandom_r(&rng->state, (unsigned char*)buf,
+	    n>(size_t)INT_MAX ? INT_MAX : (int)n);
+	RNG_UNLOCK(rng);
+}
+
+/*
+ * Global rng compatibility interface
+ *
+ */
 
 #ifdef EVENT__HAVE_ARC4RANDOM
+
+/*
+ * BSD and OSX have their own ARC4 implementation, which is
+ * threadsafe, so use this when available.
+ */
+
 #include <stdlib.h>
 #include <string.h>
-int
-evutil_secure_rng_init(void)
-{
-	/* call arc4random() now to force it to self-initialize */
-	(void) arc4random();
-	return 0;
-}
+
 #ifndef EVENT__DISABLE_THREAD_SUPPORT
 int
 evutil_secure_rng_global_setup_locks_(const int enable_locks)
@@ -57,13 +173,23 @@ evutil_secure_rng_global_setup_locks_(const int enable_locks)
 	return 0;
 }
 #endif
-static void
-evutil_free_secure_rng_globals_locks(void)
+
+void
+evutil_free_secure_rng_globals_(void)
 {
+	/* Do nothing */
 }
 
-static void
-ev_arc4random_buf(void *buf, size_t n)
+int
+evutil_secure_rng_init(void)
+{
+	/* call arc4random() now to force it to self-initialize */
+	(void) arc4random();
+	return 0;
+}
+
+void
+evutil_secure_rng_get_bytes(void *buf, size_t n)
 {
 #if defined(EVENT__HAVE_ARC4RANDOM_BUF) && !defined(__APPLE__)
 	return arc4random_buf(buf, n);
@@ -102,73 +228,6 @@ ev_arc4random_buf(void *buf, size_t n)
 #endif
 }
 
-#else /* !EVENT__HAVE_ARC4RANDOM { */
-
-#ifdef EVENT__ssize_t
-#define ssize_t EVENT__ssize_t
-#endif
-#define ARC4RANDOM_EXPORT static
-#define ARC4_LOCK_() EVLOCK_LOCK(arc4rand_lock, 0)
-#define ARC4_UNLOCK_() EVLOCK_UNLOCK(arc4rand_lock, 0)
-#ifndef EVENT__DISABLE_THREAD_SUPPORT
-static void *arc4rand_lock;
-#endif
-
-#define ARC4RANDOM_UINT32 ev_uint32_t
-#define ARC4RANDOM_NOSTIR
-#define ARC4RANDOM_NORANDOM
-#define ARC4RANDOM_NOUNIFORM
-
-#include "./arc4random.c"
-
-#ifndef EVENT__DISABLE_THREAD_SUPPORT
-int
-evutil_secure_rng_global_setup_locks_(const int enable_locks)
-{
-	EVTHREAD_SETUP_GLOBAL_LOCK(arc4rand_lock, 0);
-	return 0;
-}
-#endif
-
-static void
-evutil_free_secure_rng_globals_locks(void)
-{
-#ifndef EVENT__DISABLE_THREAD_SUPPORT
-	if (arc4rand_lock != NULL) {
-		EVTHREAD_FREE_LOCK(arc4rand_lock, 0);
-		arc4rand_lock = NULL;
-	}
-#endif
-	return;
-}
-
-int
-evutil_secure_rng_init(void)
-{
-	int val;
-
-	ARC4_LOCK_();
-	if (!arc4_seeded_ok)
-		arc4_stir();
-	val = arc4_seeded_ok ? 0 : -1;
-	ARC4_UNLOCK_();
-	return val;
-}
-
-static void
-ev_arc4random_buf(void *buf, size_t n)
-{
-	arc4random_buf(buf, n);
-}
-
-#endif /* } !EVENT__HAVE_ARC4RANDOM */
-
-void
-evutil_secure_rng_get_bytes(void *buf, size_t n)
-{
-	ev_arc4random_buf(buf, n);
-}
-
 void
 evutil_secure_rng_add_bytes(const char *buf, size_t n)
 {
@@ -176,8 +235,58 @@ evutil_secure_rng_add_bytes(const char *buf, size_t n)
 	    n>(size_t)INT_MAX ? INT_MAX : (int)n);
 }
 
+#else /* Not EVENT__HAVE_ARC4RANDOM */
+
+/*
+ * The system does not provide arc4random, so we use our own
+ * implementation.
+ *
+ * The global_rng.state will be auto initialised and stired by the
+ * first evutil_secure_rng_* call
+ *
+ * N.B. evthread_use_pthreads() must be called prior to using
+ * global_rng in multithreaded code.
+ *
+ */
+
+static struct evutil_secure_rng global_rng;
+
+#ifndef EVENT__DISABLE_THREAD_SUPPORT
+int
+evutil_secure_rng_global_setup_locks_(const int enable_locks)
+{
+	EVTHREAD_SETUP_GLOBAL_LOCK(global_rng.lock, 0);
+	return 0;
+}
+#endif
+
 void
 evutil_free_secure_rng_globals_(void)
 {
-    evutil_free_secure_rng_globals_locks();
+#ifndef EVENT__DISABLE_THREAD_SUPPORT
+	if (global_rng.lock) {
+		EVTHREAD_FREE_LOCK(global_rng.lock, 0);
+		global_rng.lock = NULL;
+	}
+#endif
 }
+
+int
+evutil_secure_rng_init(void)
+{
+	return evutil_secure_rng_init_r(&global_rng);
+}
+
+void
+evutil_secure_rng_get_bytes(void *buf, size_t n)
+{
+	evutil_secure_rng_get_bytes_r(&global_rng, buf, n);
+}
+
+void
+evutil_secure_rng_add_bytes(const char *buf, size_t n)
+{
+	evutil_secure_rng_add_bytes_r(&global_rng, buf, n);
+}
+
+#endif /* EVENT__HAVE_ARC4RANDOM */

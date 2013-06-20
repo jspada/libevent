@@ -1,5 +1,6 @@
 /* Portable arc4random.c based on arc4random.c from OpenBSD.
  * Portable version by Chris Davis, adapted for Libevent by Nick Mathewson
+ * Extended by Joseph Spadavecchia, June 2013
  * Copyright (c) 2010 Chris Davis, Niels Provos, and Nick Mathewson
  * Copyright (c) 2010-2012 Niels Provos and Nick Mathewson
  *
@@ -41,13 +42,7 @@
  * RC4 is a registered trademark of RSA Laboratories.
  */
 
-#ifndef ARC4RANDOM_EXPORT
-#define ARC4RANDOM_EXPORT
-#endif
-
-#ifndef ARC4RANDOM_UINT32
-#define ARC4RANDOM_UINT32 uint32_t
-#endif
+#include "event2/event-config.h"
 
 #ifndef ARC4RANDOM_NO_INCLUDES
 #include "evconfig-private.h"
@@ -66,7 +61,12 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+#include <assert.h>
 #endif
+
+#include "evthread-internal.h"
+#include "arc4random-internal.h"
+#include "mm-internal.h"
 
 /* Add platform entropy 32 bytes (256 bits) at a time. */
 #define ADD_ENTROPY 32
@@ -74,54 +74,47 @@
 /* Re-seed from the platform RNG after generating this many bytes. */
 #define BYTES_BEFORE_RESEED 1600000
 
-struct arc4_stream {
-	unsigned char i;
-	unsigned char j;
-	unsigned char s[256];
-};
-
-#ifdef _WIN32
-#define getpid _getpid
-#define pid_t int
-#endif
-
-static int rs_initialized;
-static struct arc4_stream rs;
-static pid_t arc4_stir_pid;
-static int arc4_count;
-static int arc4_seeded_ok;
-
-static inline unsigned char arc4_getbyte(void);
-
 static inline void
-arc4_init(void)
+arc4_init(struct arc4_stream *rs)
 {
-	int     n;
+	int n;
+
+	assert(rs);
 
 	for (n = 0; n < 256; n++)
-		rs.s[n] = n;
-	rs.i = 0;
-	rs.j = 0;
+		rs->s[n] = n;
+	rs->i = 0;
+	rs->j = 0;
+	rs->initialized = 1;
+	rs->count = 0;
+	rs->seeded_ok = 0;
 }
 
 static inline void
-arc4_addrandom(const unsigned char *dat, int datlen)
+arc4_addrandom(struct arc4_stream *rs, const unsigned char *buf, int n)
 {
-	int     n;
+	int i;
 	unsigned char si;
 
-	rs.i--;
-	for (n = 0; n < 256; n++) {
-		rs.i = (rs.i + 1);
-		si = rs.s[rs.i];
-		rs.j = (rs.j + si + dat[n % datlen]);
-		rs.s[rs.i] = rs.s[rs.j];
-		rs.s[rs.j] = si;
+	assert(rs);
+
+	rs->i--;
+	for (i = 0; i < 256; i++) {
+		rs->i = (rs->i + 1);
+		si = rs->s[rs->i];
+		rs->j = (rs->j + si + buf[i % n]);
+		rs->s[rs->i] = rs->s[rs->j];
+		rs->s[rs->j] = si;
 	}
-	rs.j = rs.i;
+	rs->j = rs->i;
 }
 
 #ifndef _WIN32
+
+#ifdef EVENT__ssize_t
+#define ssize_t EVENT__ssize_t
+#endif
+
 static ssize_t
 read_all(int fd, unsigned char *buf, size_t count)
 {
@@ -139,17 +132,19 @@ read_all(int fd, unsigned char *buf, size_t count)
 
 	return (ssize_t)numread;
 }
-#endif
+#endif /* _WIN32 */
 
 #ifdef _WIN32
 #define TRY_SEED_WIN32
 static int
-arc4_seed_win32(void)
+arc4_seed_win32(struct arc4_stream *rs)
 {
 	/* This is adapted from Tor's crypto_seed_rng() */
 	static int provider_set = 0;
 	static HCRYPTPROV provider;
 	unsigned char buf[ADD_ENTROPY];
+
+	assert(rs);
 
 	if (!provider_set) {
 		if (!CryptAcquireContext(&provider, NULL, NULL, PROV_RSA_FULL,
@@ -161,9 +156,9 @@ arc4_seed_win32(void)
 	}
 	if (!CryptGenRandom(provider, sizeof(buf), buf))
 		return -1;
-	arc4_addrandom(buf, sizeof(buf));
+	arc4_addrandom(rs, buf, sizeof(buf));
 	memset(buf, 0, sizeof(buf));
-	arc4_seeded_ok = 1;
+	rs->seeded_ok = 1;
 	return 0;
 }
 #endif
@@ -172,7 +167,7 @@ arc4_seed_win32(void)
 #if EVENT__HAVE_DECL_CTL_KERN && EVENT__HAVE_DECL_KERN_RANDOM && EVENT__HAVE_DECL_RANDOM_UUID
 #define TRY_SEED_SYSCTL_LINUX
 static int
-arc4_seed_sysctl_linux(void)
+arc4_seed_sysctl_linux(struct arc4_stream *rs)
 {
 	/* Based on code by William Ahern, this function tries to use the
 	 * RANDOM_UUID sysctl to get entropy from the kernel.  This can work
@@ -183,6 +178,8 @@ arc4_seed_sysctl_linux(void)
 	size_t len, n;
 	unsigned i;
 	int any_set;
+
+	assert(rs);
 
 	memset(buf, 0, sizeof(buf));
 
@@ -199,9 +196,9 @@ arc4_seed_sysctl_linux(void)
 	if (!any_set)
 		return -1;
 
-	arc4_addrandom(buf, sizeof(buf));
+	arc4_addrandom(rs, buf, sizeof(buf));
 	memset(buf, 0, sizeof(buf));
-	arc4_seeded_ok = 1;
+	rs->seeded_ok = 1;
 	return 0;
 }
 #endif
@@ -209,7 +206,7 @@ arc4_seed_sysctl_linux(void)
 #if EVENT__HAVE_DECL_CTL_KERN && EVENT__HAVE_DECL_KERN_ARND
 #define TRY_SEED_SYSCTL_BSD
 static int
-arc4_seed_sysctl_bsd(void)
+arc4_seed_sysctl_bsd(struct arc4_stream *rs)
 {
 	/* Based on code from William Ahern and from OpenBSD, this function
 	 * tries to use the KERN_ARND syscall to get entropy from the kernel.
@@ -219,6 +216,8 @@ arc4_seed_sysctl_bsd(void)
 	unsigned char buf[ADD_ENTROPY];
 	size_t len, n;
 	int i, any_set;
+
+	assert(rs);
 
 	memset(buf, 0, sizeof(buf));
 
@@ -239,9 +238,9 @@ arc4_seed_sysctl_bsd(void)
 	if (!any_set)
 		return -1;
 
-	arc4_addrandom(buf, sizeof(buf));
+	arc4_addrandom(rs, buf, sizeof(buf));
 	memset(buf, 0, sizeof(buf));
-	arc4_seeded_ok = 1;
+	rs->seeded_ok = 1;
 	return 0;
 }
 #endif
@@ -250,7 +249,7 @@ arc4_seed_sysctl_bsd(void)
 #ifdef __linux__
 #define TRY_SEED_PROC_SYS_KERNEL_RANDOM_UUID
 static int
-arc4_seed_proc_sys_kernel_random_uuid(void)
+arc4_seed_proc_sys_kernel_random_uuid(struct arc4_stream *rs)
 {
 	/* Occasionally, somebody will make /proc/sys accessible in a chroot,
 	 * but not /dev/urandom.  Let's try /proc/sys/kernel/random/uuid.
@@ -260,6 +259,9 @@ arc4_seed_proc_sys_kernel_random_uuid(void)
 	char buf[128];
 	unsigned char entropy[64];
 	int bytes, n, i, nybbles;
+
+	assert(rs);
+
 	for (bytes = 0; bytes<ADD_ENTROPY; ) {
 		fd = evutil_open_closeonexec_("/proc/sys/kernel/random/uuid", O_RDONLY, 0);
 		if (fd < 0)
@@ -282,12 +284,12 @@ arc4_seed_proc_sys_kernel_random_uuid(void)
 		}
 		if (nybbles < 2)
 			return -1;
-		arc4_addrandom(entropy, nybbles/2);
+		arc4_addrandom(rs, entropy, nybbles/2);
 		bytes += nybbles/2;
 	}
 	memset(entropy, 0, sizeof(entropy));
 	memset(buf, 0, sizeof(buf));
-	arc4_seeded_ok = 1;
+	rs->seeded_ok = 1;
 	return 0;
 }
 #endif
@@ -295,7 +297,7 @@ arc4_seed_proc_sys_kernel_random_uuid(void)
 #ifndef _WIN32
 #define TRY_SEED_URANDOM
 static int
-arc4_seed_urandom(void)
+arc4_seed_urandom(struct arc4_stream *rs)
 {
 	/* This is adapted from Tor's crypto_seed_rng() */
 	static const char *filenames[] = {
@@ -305,6 +307,8 @@ arc4_seed_urandom(void)
 	int fd, i;
 	size_t n;
 
+	assert(rs);
+
 	for (i = 0; filenames[i]; ++i) {
 		fd = evutil_open_closeonexec_(filenames[i], O_RDONLY, 0);
 		if (fd<0)
@@ -313,9 +317,9 @@ arc4_seed_urandom(void)
 		close(fd);
 		if (n != sizeof(buf))
 			return -1;
-		arc4_addrandom(buf, sizeof(buf));
+		arc4_addrandom(rs, buf, sizeof(buf));
 		memset(buf, 0, sizeof(buf));
-		arc4_seeded_ok = 1;
+		rs->seeded_ok = 1;
 		return 0;
 	}
 
@@ -324,49 +328,69 @@ arc4_seed_urandom(void)
 #endif
 
 static int
-arc4_seed(void)
+arc4_seed(struct arc4_stream *rs)
 {
 	int ok = 0;
+
+	assert(rs);
+
 	/* We try every method that might work, and don't give up even if one
 	 * does seem to work.  There's no real harm in over-seeding, and if
 	 * one of these sources turns out to be broken, that would be bad. */
 #ifdef TRY_SEED_WIN32
-	if (0 == arc4_seed_win32())
+	if (0 == arc4_seed_win32(rs))
 		ok = 1;
 #endif
 #ifdef TRY_SEED_URANDOM
-	if (0 == arc4_seed_urandom())
+	if (0 == arc4_seed_urandom(rs))
 		ok = 1;
 #endif
 #ifdef TRY_SEED_PROC_SYS_KERNEL_RANDOM_UUID
-	if (0 == arc4_seed_proc_sys_kernel_random_uuid())
+	if (0 == arc4_seed_proc_sys_kernel_random_uuid(rs))
 		ok = 1;
 #endif
 #ifdef TRY_SEED_SYSCTL_LINUX
 	/* Apparently Linux is deprecating sysctl, and spewing warning
 	 * messages when you try to use it. */
-	if (!ok && 0 == arc4_seed_sysctl_linux())
+	if (!ok && 0 == arc4_seed_sysctl_linux(rs))
 		ok = 1;
 #endif
 #ifdef TRY_SEED_SYSCTL_BSD
-	if (0 == arc4_seed_sysctl_bsd())
+	if (0 == arc4_seed_sysctl_bsd(rs))
 		ok = 1;
 #endif
 	return ok ? 0 : -1;
 }
 
-static int
-arc4_stir(void)
+static inline unsigned char
+arc4_getbyte(struct arc4_stream *rs)
 {
-	int     i;
+	unsigned char si, sj;
 
-	if (!rs_initialized) {
-		arc4_init();
-		rs_initialized = 1;
-	}
+	assert(rs);
 
-	arc4_seed();
-	if (!arc4_seeded_ok)
+	rs->i = (rs->i + 1);
+	si = rs->s[rs->i];
+	rs->j = (rs->j + si);
+	sj = rs->s[rs->j];
+	rs->s[rs->i] = sj;
+	rs->s[rs->j] = si;
+
+	return (rs->s[(si + sj) & 0xff]);
+}
+
+static int
+arc4_stir(struct arc4_stream *rs)
+{
+	int i;
+
+	assert(rs);
+
+	if (!rs->initialized)
+		arc4_init(rs);
+
+	arc4_seed(rs);
+	if (!rs->seeded_ok)
 		return -1;
 
 	/*
@@ -388,113 +412,78 @@ arc4_stir(void)
 	 * We add another sect to the cargo cult, and choose 12*256.
 	 */
 	for (i = 0; i < 12*256; i++)
-		(void)arc4_getbyte();
-
-	arc4_count = BYTES_BEFORE_RESEED;
+		(void)arc4_getbyte(rs);
+	rs->count = BYTES_BEFORE_RESEED;
 
 	return 0;
 }
 
 
 static void
-arc4_stir_if_needed(void)
+arc4_stir_if_needed(struct arc4_stream *rs)
 {
 	pid_t pid = getpid();
 
-	if (arc4_count <= 0 || !rs_initialized || arc4_stir_pid != pid)
-	{
-		arc4_stir_pid = pid;
-		arc4_stir();
+	assert(rs);
+
+	if (rs->count <= 0 || !rs->initialized || rs->stir_pid != pid) {
+		rs->stir_pid = pid;
+		arc4_stir(rs);
 	}
-}
-
-static inline unsigned char
-arc4_getbyte(void)
-{
-	unsigned char si, sj;
-
-	rs.i = (rs.i + 1);
-	si = rs.s[rs.i];
-	rs.j = (rs.j + si);
-	sj = rs.s[rs.j];
-	rs.s[rs.i] = sj;
-	rs.s[rs.j] = si;
-	return (rs.s[(si + sj) & 0xff]);
 }
 
 static inline unsigned int
-arc4_getword(void)
+arc4_getword(struct arc4_stream *rs)
 {
 	unsigned int val;
 
-	val = arc4_getbyte() << 24;
-	val |= arc4_getbyte() << 16;
-	val |= arc4_getbyte() << 8;
-	val |= arc4_getbyte();
+	assert(rs);
+
+	val = arc4_getbyte(rs) << 24;
+	val |= arc4_getbyte(rs) << 16;
+	val |= arc4_getbyte(rs) << 8;
+	val |= arc4_getbyte(rs);
 
 	return val;
 }
 
-#ifndef ARC4RANDOM_NOSTIR
-ARC4RANDOM_EXPORT int
-arc4random_stir(void)
-{
-	int val;
-	ARC4_LOCK_();
-	val = arc4_stir();
-	ARC4_UNLOCK_();
-	return val;
-}
-#endif
+/* Public interface */
 
-#ifndef ARC4RANDOM_NOADDRANDOM
-ARC4RANDOM_EXPORT void
-arc4random_addrandom(const unsigned char *dat, int datlen)
+int
+arc4random_init_r(struct arc4_stream *rs)
 {
-	int j;
-	ARC4_LOCK_();
-	if (!rs_initialized)
-		arc4_stir();
-	for (j = 0; j < datlen; j += 256) {
-		/* arc4_addrandom() ignores all but the first 256 bytes of
-		 * its input.  We want to make sure to look at ALL the
-		 * data in 'dat', just in case the user is doing something
-		 * crazy like passing us all the files in /var/log. */
-		arc4_addrandom(dat + j, datlen - j);
-	}
-	ARC4_UNLOCK_();
-}
-#endif
+	assert(rs);
 
-#ifndef ARC4RANDOM_NORANDOM
-ARC4RANDOM_EXPORT ARC4RANDOM_UINT32
-arc4random(void)
-{
-	ARC4RANDOM_UINT32 val;
-	ARC4_LOCK_();
-	arc4_count -= 4;
-	arc4_stir_if_needed();
-	val = arc4_getword();
-	ARC4_UNLOCK_();
-	return val;
+	arc4_init(rs);
+	return arc4_stir(rs);
 }
-#endif
 
-ARC4RANDOM_EXPORT void
-arc4random_buf(void *buf_, size_t n)
+ARC4RANDOM_UINT32
+arc4random_r(struct arc4_stream *rs)
 {
-	unsigned char *buf = buf_;
-	ARC4_LOCK_();
-	arc4_stir_if_needed();
+	assert(rs);
+
+	rs->count -= 4;
+	arc4_stir_if_needed(rs);
+
+	return arc4_getword(rs);
+}
+
+void
+arc4random_buf_r(struct arc4_stream *rs, void *buf, size_t n)
+{
+	unsigned char *dat = buf;
+
+	assert(rs);
+
+	arc4_stir_if_needed(rs);
 	while (n--) {
-		if (--arc4_count <= 0)
-			arc4_stir();
-		buf[n] = arc4_getbyte();
+		if (--rs->count <= 0)
+			arc4_stir(rs);
+		dat[n] = arc4_getbyte(rs);
 	}
-	ARC4_UNLOCK_();
 }
 
-#ifndef ARC4RANDOM_NOUNIFORM
 /*
  * Calculate a uniformly distributed random number less than upper_bound
  * avoiding "modulo bias".
@@ -505,10 +494,12 @@ arc4random_buf(void *buf_, size_t n)
  * [2**32 % upper_bound, 2**32) which maps back to [0, upper_bound)
  * after reduction modulo upper_bound.
  */
-ARC4RANDOM_EXPORT unsigned int
-arc4random_uniform(unsigned int upper_bound)
+unsigned int
+arc4random_uniform_r(struct arc4_stream *rs, unsigned int upper_bound)
 {
 	ARC4RANDOM_UINT32 r, min;
+
+	assert(rs);
 
 	if (upper_bound < 2)
 		return 0;
@@ -532,11 +523,36 @@ arc4random_uniform(unsigned int upper_bound)
 	 * to re-roll.
 	 */
 	for (;;) {
-		r = arc4random();
+		r = arc4random_r(rs);
 		if (r >= min)
 			break;
 	}
 
 	return r % upper_bound;
 }
-#endif
+
+int
+arc4random_stir_r(struct arc4_stream *rs)
+{
+	assert(rs);
+
+	return arc4_stir(rs);
+}
+
+void
+arc4random_addrandom_r(struct arc4_stream *rs, const unsigned char *buf, int n)
+{
+	int j;
+
+	assert(rs);
+
+	if (!rs->initialized)
+		arc4_stir(rs);
+	for (j = 0; j < n; j += 256) {
+		/* arc4_addrandom() ignores all but the first 256 bytes of
+		 * its input.  We want to make sure to look at ALL the
+		 * data in 'buf', just in case the user is doing something
+		 * crazy like passing us all the files in /var/log. */
+		arc4_addrandom(rs, buf + j, n - j);
+	}
+}
